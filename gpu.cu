@@ -1,10 +1,23 @@
 #include "common.h"
 #include <cuda.h>
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
 
 #define NUM_THREADS 256
 
-// Put any static global variables here that you will use throughout the simulation.
-int blks;
+// Grid & Simulation parameters
+static int grid_dim = 0;
+static int total_cells = 0;
+static double cell_size = 0.0;
+static int part_blocks = 0;
+static int cell_blocks = 0;
+
+// Device buffers
+static int* d_cell_ids = nullptr;
+static int* d_particle_indices = nullptr;
+static particle_t* d_sorted_parts = nullptr;
+static int* d_cell_start = nullptr;
+static int* d_cell_end = nullptr;
 
 __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     double dx = neighbor.x - particle.x;
@@ -24,43 +37,100 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     particle.ay += coef * dy;
 }
 
-__global__ void compute_forces_gpu(particle_t* particles, int num_parts) {
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= num_parts)
-        return;
+__global__ void compute_cell_ids_gpu(const particle_t* parts, int* cell_ids, int* indices, 
+                                     int num_parts, int g_dim, double c_size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
 
-    particles[tid].ax = particles[tid].ay = 0;
-    for (int j = 0; j < num_parts; j++)
-        apply_force_gpu(particles[tid], particles[j]);
+    int cx = (int)(parts[tid].x / c_size);
+    int cy = (int)(parts[tid].y / c_size);
+
+    cx = min(max(cx, 0), g_dim - 1);
+    cy = min(max(cy, 0), g_dim - 1);
+
+    cell_ids[tid] = cy * g_dim + cx;
+    indices[tid] = tid;
 }
 
-__global__ void move_gpu(particle_t* particles, int num_parts, double size) {
+__global__ void reorder_particles_gpu(particle_t* sorted_parts, const particle_t* parts, 
+                                      const int* indices, int num_parts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
 
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= num_parts)
-        return;
+    int orig_idx = indices[tid];
+    sorted_parts[tid] = parts[orig_idx];
+}
 
-    particle_t* p = &particles[tid];
-    //
-    //  slightly simplified Velocity Verlet integration
-    //  conserves energy better than explicit Euler method
-    //
+__global__ void find_cell_bounds_gpu(const int* cell_ids, int* cell_start, int* cell_end, 
+                                     int num_parts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
+
+    int cell = cell_ids[tid];
+
+    if (tid == 0 || cell != cell_ids[tid - 1]) {
+        cell_start[cell] = tid;
+    }
+    if (tid == num_parts - 1 || cell != cell_ids[tid + 1]) {
+        cell_end[cell] = tid + 1; // Exclusive end
+    }
+}
+
+__global__ void compute_forces_grid_gpu(particle_t* sorted_parts, const int* cell_start, 
+                                        const int* cell_end, int num_parts, 
+                                        int g_dim, double c_size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
+
+    particle_t p = sorted_parts[tid];
+    p.ax = 0.0;
+    p.ay = 0.0;
+
+    int cx = (int)(p.x / c_size);
+    int cy = (int)(p.y / c_size);
+    cx = min(max(cx, 0), g_dim - 1);
+    cy = min(max(cy, 0), g_dim - 1);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = cy + dy;
+        if (ny < 0 || ny >= g_dim) continue;
+
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = cx + dx;
+            if (nx < 0 || nx >= g_dim) continue;
+
+            int n_cell = ny * g_dim + nx;
+            int start = cell_start[n_cell];
+            if (start == -1) continue;
+
+            int end = cell_end[n_cell];
+            for (int j = start; j < end; ++j) {
+                apply_force_gpu(p, sorted_parts[j]);
+            }
+        }
+    }
+
+    sorted_parts[tid].ax = p.ax;
+    sorted_parts[tid].ay = p.ay;
+}
+
+__global__ void move_sorted_gpu(particle_t* sorted_parts, int num_parts, double size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
+
+    particle_t* p = &sorted_parts[tid];
+
     p->vx += p->ax * dt;
     p->vy += p->ay * dt;
     p->x += p->vx * dt;
     p->y += p->vy * dt;
 
-    //
-    //  bounce from walls
-    //
-    while (p->x < 0 || p->x > size) {
-        p->x = p->x < 0 ? -(p->x) : 2 * size - p->x;
+    while (p->x < 0.0 || p->x > size) {
+        p->x = (p->x < 0.0) ? -(p->x) : 2.0 * size - p->x;
         p->vx = -(p->vx);
     }
-    while (p->y < 0 || p->y > size) {
-        p->y = p->y < 0 ? -(p->y) : 2 * size - p->y;
+    while (p->y < 0.0 || p->y > size) {
+        p->y = (p->y < 0.0) ? -(p->y) : 2.0 * size - p->y;
         p->vy = -(p->vy);
     }
 }
@@ -71,21 +141,56 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
     // parts live in GPU memory
     // Do not do any particle simulation here
 
-    blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    part_blocks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+
+    grid_dim = (int)(size / cutoff);
+    if (grid_dim < 1) grid_dim = 1;
+    cell_size = size / grid_dim;
+    total_cells = grid_dim * grid_dim;
+    cell_blocks = (total_cells + NUM_THREADS - 1) / NUM_THREADS;
+
+    cudaMalloc((void**)&d_cell_ids, num_parts * sizeof(int));
+    cudaMalloc((void**)&d_particle_indices, num_parts * sizeof(int));
+    cudaMalloc((void**)&d_sorted_parts, num_parts * sizeof(particle_t));
+    cudaMalloc((void**)&d_cell_start, total_cells * sizeof(int));
+    cudaMalloc((void**)&d_cell_end, total_cells * sizeof(int));
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
-    // parts live in GPU memory
-    // Rewrite this function
+    cudaMemset(d_cell_start, -1, total_cells * sizeof(int));
+    cudaMemset(d_cell_end, -1, total_cells * sizeof(int));
 
-    // Compute forces
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(parts, num_parts);
+    compute_cell_ids_gpu<<<part_blocks, NUM_THREADS>>>(
+        parts, d_cell_ids, d_particle_indices, num_parts, grid_dim, cell_size);
+    thrust::device_ptr<int> dev_keys(d_cell_ids);
+    thrust::device_ptr<int> dev_vals(d_particle_indices);
+    thrust::sort_by_key(dev_keys, dev_keys + num_parts, dev_vals);
 
-    // Move particles
-    move_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, size);
+    reorder_particles_gpu<<<part_blocks, NUM_THREADS>>>(
+        d_sorted_parts, parts, d_particle_indices, num_parts);
+
+    find_cell_bounds_gpu<<<part_blocks, NUM_THREADS>>>(
+        d_cell_ids, d_cell_start, d_cell_end, num_parts);
+
+    compute_forces_grid_gpu<<<part_blocks, NUM_THREADS>>>(
+        d_sorted_parts, d_cell_start, d_cell_end, num_parts, grid_dim, cell_size);
+
+    move_sorted_gpu<<<part_blocks, NUM_THREADS>>>(
+        d_sorted_parts, num_parts, size);
+
+    cudaMemcpy(parts, d_sorted_parts, num_parts * sizeof(particle_t), cudaMemcpyDeviceToDevice);
 }
-
 // Clear allocations
 void clear_simulation() {
+    if (d_cell_ids) cudaFree(d_cell_ids);
+    if (d_particle_indices) cudaFree(d_particle_indices);
+    if (d_sorted_parts) cudaFree(d_sorted_parts);
+    if (d_cell_start) cudaFree(d_cell_start);
+    if (d_cell_end) cudaFree(d_cell_end);
 
+    d_cell_ids = nullptr;
+    d_particle_indices = nullptr;
+    d_sorted_parts = nullptr;
+    d_cell_start = nullptr;
+    d_cell_end = nullptr;
 }
