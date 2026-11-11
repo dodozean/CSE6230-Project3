@@ -10,31 +10,36 @@ static int grid_dim = 0;
 static int total_cells = 0;
 static double cell_size = 0.0;
 static int part_blocks = 0;
-static int cell_blocks = 0;
+static int current_step = 0;
 
 // Device buffers
 static int* d_cell_ids = nullptr;
 static int* d_particle_indices = nullptr;
+static int* d_orig_id = nullptr;
+static int* d_sorted_orig_id = nullptr;
 static particle_t* d_sorted_parts = nullptr;
 static int* d_cell_start = nullptr;
 static int* d_cell_end = nullptr;
 
-__device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
+__device__ void apply_force_gpu(particle_t& particle, const particle_t& neighbor) {
     double dx = neighbor.x - particle.x;
     double dy = neighbor.y - particle.y;
     double r2 = dx * dx + dy * dy;
     if (r2 > cutoff * cutoff)
         return;
-    // r2 = fmax( r2, min_r*min_r );
     r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
     double r = sqrt(r2);
 
-    //
-    //  very simple short-range repulsive force
-    //
-    double coef = (1 - cutoff / r) / r2 / mass;
+    double coef = (1.0 - cutoff / r) / r2 / mass;
     particle.ax += coef * dx;
     particle.ay += coef * dy;
+}
+
+__global__ void init_indices_gpu(int* orig_id, int num_parts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < num_parts) {
+        orig_id[tid] = tid;
+    }
 }
 
 __global__ void compute_cell_ids_gpu(const particle_t* parts, int* cell_ids, int* indices, 
@@ -52,13 +57,15 @@ __global__ void compute_cell_ids_gpu(const particle_t* parts, int* cell_ids, int
     indices[tid] = tid;
 }
 
-__global__ void reorder_particles_gpu(particle_t* sorted_parts, const particle_t* parts, 
-                                      const int* indices, int num_parts) {
+__global__ void reorder_particles_and_ids_gpu(particle_t* sorted_parts, const particle_t* parts,
+                                              int* sorted_orig_id, const int* orig_id,
+                                              const int* indices, int num_parts) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_parts) return;
 
-    int orig_idx = indices[tid];
-    sorted_parts[tid] = parts[orig_idx];
+    int orig_buf_idx = indices[tid];
+    sorted_parts[tid] = parts[orig_buf_idx];
+    sorted_orig_id[tid] = orig_id[orig_buf_idx];
 }
 
 __global__ void find_cell_bounds_gpu(const int* cell_ids, int* cell_start, int* cell_end, 
@@ -72,7 +79,7 @@ __global__ void find_cell_bounds_gpu(const int* cell_ids, int* cell_start, int* 
         cell_start[cell] = tid;
     }
     if (tid == num_parts - 1 || cell != cell_ids[tid + 1]) {
-        cell_end[cell] = tid + 1; // Exclusive end
+        cell_end[cell] = tid + 1;
     }
 }
 
@@ -135,25 +142,33 @@ __global__ void move_sorted_gpu(particle_t* sorted_parts, int num_parts, double 
     }
 }
 
-void init_simulation(particle_t* parts, int num_parts, double size) {
-    // You can use this space to initialize data objects that you may need
-    // This function will be called once before the algorithm begins
-    // parts live in GPU memory
-    // Do not do any particle simulation here
+__global__ void restore_particles_gpu(particle_t* dest, const particle_t* src,
+                                      const int* orig_indices, int num_parts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_parts) return;
 
+    int orig_idx = orig_indices[tid];
+    dest[orig_idx] = src[tid];
+}
+
+void init_simulation(particle_t* parts, int num_parts, double size) {
     part_blocks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    current_step = 0;
 
     grid_dim = (int)(size / cutoff);
     if (grid_dim < 1) grid_dim = 1;
     cell_size = size / grid_dim;
     total_cells = grid_dim * grid_dim;
-    cell_blocks = (total_cells + NUM_THREADS - 1) / NUM_THREADS;
 
     cudaMalloc((void**)&d_cell_ids, num_parts * sizeof(int));
     cudaMalloc((void**)&d_particle_indices, num_parts * sizeof(int));
+    cudaMalloc((void**)&d_orig_id, num_parts * sizeof(int));
+    cudaMalloc((void**)&d_sorted_orig_id, num_parts * sizeof(int));
     cudaMalloc((void**)&d_sorted_parts, num_parts * sizeof(particle_t));
     cudaMalloc((void**)&d_cell_start, total_cells * sizeof(int));
     cudaMalloc((void**)&d_cell_end, total_cells * sizeof(int));
+
+    init_indices_gpu<<<part_blocks, NUM_THREADS>>>(d_orig_id, num_parts);
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
@@ -162,12 +177,13 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
 
     compute_cell_ids_gpu<<<part_blocks, NUM_THREADS>>>(
         parts, d_cell_ids, d_particle_indices, num_parts, grid_dim, cell_size);
+
     thrust::device_ptr<int> dev_keys(d_cell_ids);
     thrust::device_ptr<int> dev_vals(d_particle_indices);
     thrust::sort_by_key(dev_keys, dev_keys + num_parts, dev_vals);
 
-    reorder_particles_gpu<<<part_blocks, NUM_THREADS>>>(
-        d_sorted_parts, parts, d_particle_indices, num_parts);
+    reorder_particles_and_ids_gpu<<<part_blocks, NUM_THREADS>>>(
+        d_sorted_parts, parts, d_sorted_orig_id, d_orig_id, d_particle_indices, num_parts);
 
     find_cell_bounds_gpu<<<part_blocks, NUM_THREADS>>>(
         d_cell_ids, d_cell_start, d_cell_end, num_parts);
@@ -178,18 +194,32 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     move_sorted_gpu<<<part_blocks, NUM_THREADS>>>(
         d_sorted_parts, num_parts, size);
 
-    cudaMemcpy(parts, d_sorted_parts, num_parts * sizeof(particle_t), cudaMemcpyDeviceToDevice);
+    if ((current_step % savefreq) == 0) {
+        restore_particles_gpu<<<part_blocks, NUM_THREADS>>>(
+            parts, d_sorted_parts, d_sorted_orig_id, num_parts);
+
+        init_indices_gpu<<<part_blocks, NUM_THREADS>>>(d_orig_id, num_parts);
+    } else {
+        cudaMemcpy(parts, d_sorted_parts, num_parts * sizeof(particle_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_orig_id, d_sorted_orig_id, num_parts * sizeof(int), cudaMemcpyDeviceToDevice);
+    }
+
+    current_step++;
 }
-// Clear allocations
+
 void clear_simulation() {
     if (d_cell_ids) cudaFree(d_cell_ids);
     if (d_particle_indices) cudaFree(d_particle_indices);
+    if (d_orig_id) cudaFree(d_orig_id);
+    if (d_sorted_orig_id) cudaFree(d_sorted_orig_id);
     if (d_sorted_parts) cudaFree(d_sorted_parts);
     if (d_cell_start) cudaFree(d_cell_start);
     if (d_cell_end) cudaFree(d_cell_end);
 
     d_cell_ids = nullptr;
     d_particle_indices = nullptr;
+    d_orig_id = nullptr;
+    d_sorted_orig_id = nullptr;
     d_sorted_parts = nullptr;
     d_cell_start = nullptr;
     d_cell_end = nullptr;
